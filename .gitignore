@@ -1,0 +1,12 @@
+# Binaries & Temporary files
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VSWorkspace/
