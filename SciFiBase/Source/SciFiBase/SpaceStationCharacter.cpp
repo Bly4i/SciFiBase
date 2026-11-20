@@ -7,6 +7,12 @@
 #include "InputActionValue.h"
 #include "InputAction.h"
 #include "InputMappingContext.h"
+#include "Weapon.h"
+#include "Blueprint/UserWidget.h"
+#include "Engine/World.h"
+#include "Animation/AnimInstance.h"
+#include "Animation/AnimMontage.h"
+#include "DrawDebugHelpers.h"
 
 ASpaceStationCharacter::ASpaceStationCharacter()
 {
@@ -22,9 +28,11 @@ ASpaceStationCharacter::ASpaceStationCharacter()
 	// Инициализация параметров движения
 	WalkSpeed = 600.0f;
 	SprintSpeed = 1000.0f;
+	AimWalkSpeed = 300.0f;
 	StaminaDrainRate = 25.0f;
 	StaminaRegenRate = 20.0f;
 	bIsSprinting = false;
+	bIsAiming = false;
 
 	// Установка базовой скорости ходьбы
 	GetCharacterMovement()->MaxWalkSpeed = WalkSpeed;
@@ -32,7 +40,8 @@ ASpaceStationCharacter::ASpaceStationCharacter()
 	// Настройка SpringArm (Плечо камеры)
 	CameraBoom = CreateDefaultSubobject<USpringArmComponent>(TEXT("CameraBoom"));
 	CameraBoom->SetupAttachment(RootComponent);
-	CameraBoom->TargetArmLength = 300.0f;
+	CameraBoom->TargetArmLength = 180.0f;
+	CameraBoom->SocketOffset = FVector(0.0f, 65.0f, 30.0f);
 	CameraBoom->bUsePawnControlRotation = true; // Камера вращается вместе с контроллером
 
 	// Настройка Камеры
@@ -46,8 +55,8 @@ ASpaceStationCharacter::ASpaceStationCharacter()
 	bUseControllerRotationRoll = false;
 
 	GetCharacterMovement()->bOrientRotationToMovement = false; // Отключаем поворот лицом по ходу движения
-	GetCharacterMovement()->bUseControllerDesiredRotation = true; // Включаем плавний поворот за камерой!
-	GetCharacterMovement()->RotationRate = FRotator(0.0f, 500.0f, 0.0f); // Скорость поворота (чем больше, тем быстрее крутится)
+	GetCharacterMovement()->bUseControllerDesiredRotation = true; // Включаем плавный поворот за камерой
+	GetCharacterMovement()->RotationRate = FRotator(0.0f, 500.0f, 0.0f); // Скорость поворота
 }
 
 void ASpaceStationCharacter::BeginPlay()
@@ -55,6 +64,7 @@ void ASpaceStationCharacter::BeginPlay()
 	Super::BeginPlay();
 	Health = MaxHealth;
 	Stamina = MaxStamina;
+	UpdateMovementSpeed();
 
 	// Добавляем Input Mapping Context (IMC_Default) в подсистему ввода игрока
 	if (APlayerController* PlayerController = Cast<APlayerController>(Controller))
@@ -64,6 +74,36 @@ void ASpaceStationCharacter::BeginPlay()
 			if (DefaultMappingContext)
 			{
 				Subsystem->AddMappingContext(DefaultMappingContext, 0);
+			}
+		}
+	}
+
+	// Спавн и крепление оружия к сокету правой руки
+	if (UWorld* World = GetWorld())
+	{
+		if (WeaponClass && GetMesh())
+		{
+			FActorSpawnParameters SpawnParams;
+			SpawnParams.Owner = this;
+			SpawnParams.Instigator = this;
+
+			EquippedWeapon = World->SpawnActor<AWeapon>(WeaponClass, FTransform::Identity, SpawnParams);
+			if (EquippedWeapon)
+			{
+				EquippedWeapon->AttachToComponent(
+					GetMesh(),
+					FAttachmentTransformRules::SnapToTargetNotIncludingScale,
+					WeaponSocketName
+				);
+			}
+		}
+
+		// Добавление прицела на экран локальному игроку
+		if (IsLocallyControlled() && CrosshairWidgetClass)
+		{
+			if (UUserWidget* Crosshair = CreateWidget<UUserWidget>(World, CrosshairWidgetClass))
+			{
+				Crosshair->AddToViewport();
 			}
 		}
 	}
@@ -99,6 +139,19 @@ void ASpaceStationCharacter::SetupPlayerInputComponent(UInputComponent* PlayerIn
 			EnhancedInputComp->BindAction(IA_Sprint, ETriggerEvent::Started, this, &ASpaceStationCharacter::StartSprint);
 			EnhancedInputComp->BindAction(IA_Sprint, ETriggerEvent::Completed, this, &ASpaceStationCharacter::StopSprint);
 		}
+
+		// Привязка прицеливания (ПКМ по зажатию)
+		if (IA_Aim)
+		{
+			EnhancedInputComp->BindAction(IA_Aim, ETriggerEvent::Started, this, &ASpaceStationCharacter::StartAim);
+			EnhancedInputComp->BindAction(IA_Aim, ETriggerEvent::Completed, this, &ASpaceStationCharacter::StopAim);
+		}
+
+		// Привязка стрельбы (ЛКМ)
+		if (IA_Fire)
+		{
+			EnhancedInputComp->BindAction(IA_Fire, ETriggerEvent::Started, this, &ASpaceStationCharacter::Fire);
+		}
 	}
 }
 
@@ -130,6 +183,76 @@ void ASpaceStationCharacter::Look(const FInputActionValue& Value)
 	}
 }
 
+void ASpaceStationCharacter::Fire()
+{
+	if (bIsDead || !EquippedWeapon)
+	{
+		return;
+	}
+
+	// Проигрываем монтаж выстрела
+	if (FireMontage && GetMesh() && GetMesh()->GetAnimInstance())
+	{
+		GetMesh()->GetAnimInstance()->Montage_Play(FireMontage);
+	}
+
+	// Базовый трейсер (лайнтрейс) для визуализации выстрела
+	if (UWorld* World = GetWorld())
+	{
+		FVector TraceStart;
+		FVector TraceEnd;
+		const float TraceRange = 5000.0f;
+
+		if (FollowCamera)
+		{
+			TraceStart = FollowCamera->GetComponentLocation();
+			TraceEnd = TraceStart + (FollowCamera->GetForwardVector() * TraceRange);
+		}
+		else
+		{
+			FVector EyeLocation;
+			FRotator EyeRotation;
+			GetActorEyesViewPoint(EyeLocation, EyeRotation);
+			TraceStart = EyeLocation;
+			TraceEnd = TraceStart + (EyeRotation.Vector() * TraceRange);
+		}
+
+		FHitResult HitResult;
+		FCollisionQueryParams QueryParams;
+		QueryParams.AddIgnoredActor(this);
+		QueryParams.AddIgnoredActor(EquippedWeapon);
+
+		const bool bHit = World->LineTraceSingleByChannel(
+			HitResult,
+			TraceStart,
+			TraceEnd,
+			ECC_Visibility,
+			QueryParams
+		);
+
+		const FVector EndPoint = bHit ? HitResult.ImpactPoint : TraceEnd;
+
+		// Рисуем линию трейсера на 1.5 секунды
+		DrawDebugLine(
+			World,
+			TraceStart,
+			EndPoint,
+			bHit ? FColor::Red : FColor::Yellow,
+			false,
+			1.5f,
+			0,
+			2.0f
+		);
+
+		if (bHit)
+		{
+			DrawDebugPoint(World, HitResult.ImpactPoint, 8.0f, FColor::Red, false, 1.5f);
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("Fire pressed!"));
+}
+
 void ASpaceStationCharacter::TakeCustomDamage_Implementation(float DamageAmount, AActor* DamageCauser)
 {
 	if (bIsDead || DamageAmount <= 0.0f) return;
@@ -147,6 +270,7 @@ void ASpaceStationCharacter::Die()
 	if (bIsDead) return;
 
 	bIsDead = true;
+	bIsAiming = false;
 	StopSprint();
 	GetCharacterMovement()->DisableMovement();
 	UE_LOG(LogTemp, Warning, TEXT("Character has died!"));
@@ -154,23 +278,56 @@ void ASpaceStationCharacter::Die()
 
 void ASpaceStationCharacter::StartSprint()
 {
-	if (bIsDead || Stamina <= 0.0f) return;
+	if (bIsDead || bIsAiming || Stamina <= 0.0f) return;
 
 	bIsSprinting = true;
-	GetCharacterMovement()->MaxWalkSpeed = SprintSpeed;
+	UpdateMovementSpeed();
 }
 
 void ASpaceStationCharacter::StopSprint()
 {
 	bIsSprinting = false;
-	GetCharacterMovement()->MaxWalkSpeed = WalkSpeed;
+	UpdateMovementSpeed();
+}
+
+void ASpaceStationCharacter::StartAim()
+{
+	if (bIsDead) return;
+
+	bIsAiming = true;
+	bIsSprinting = false;
+	UpdateMovementSpeed();
+}
+
+void ASpaceStationCharacter::StopAim()
+{
+	bIsAiming = false;
+	UpdateMovementSpeed();
+}
+
+void ASpaceStationCharacter::UpdateMovementSpeed()
+{
+	if (!GetCharacterMovement()) return;
+
+	if (bIsAiming)
+	{
+		GetCharacterMovement()->MaxWalkSpeed = AimWalkSpeed;
+	}
+	else if (bIsSprinting)
+	{
+		GetCharacterMovement()->MaxWalkSpeed = SprintSpeed;
+	}
+	else
+	{
+		GetCharacterMovement()->MaxWalkSpeed = WalkSpeed;
+	}
 }
 
 void ASpaceStationCharacter::UpdateStamina(float DeltaTime)
 {
 	bool bIsMoving = GetVelocity().SizeSquared2D() > 10.0f;
 
-	if (bIsSprinting && bIsMoving)
+	if (bIsSprinting && !bIsAiming && bIsMoving)
 	{
 		Stamina = FMath::Clamp(Stamina - (StaminaDrainRate * DeltaTime), 0.0f, MaxStamina);
 
